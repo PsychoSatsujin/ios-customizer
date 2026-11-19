@@ -172,6 +172,8 @@ struct LivePhotoMaker: Sendable {
         /// Passthrough metadata writer inputs need the source format as a hint.
         let format: CMFormatDescription
         let isStill: Bool
+        /// Where the template's edit list places the track's first sample.
+        let presentationStart: CMTime
     }
 
     struct SourceInfo {
@@ -467,16 +469,24 @@ struct LivePhotoMaker: Sendable {
             throw LivePhotoError.writerFailed("The video track cannot be added.")
         }
         writer.add(videoInput)
+        let pixelAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: nil
+        )
 
+        // The video compositor never renders faster than the source (a 30 fps clip comes out at
+        // 30 fps whatever frameDuration says), so the frames are placed on an exact 60 fps grid here.
         let outputSeconds = CMTimeGetSeconds(outputDuration)
-        var pumps: [SamplePump] = [
-            SamplePump(
+        var pumps: [MediaPump] = [
+            FrameGridPump(
                 label: "video",
                 output: videoOutput,
-                input: videoInput,
-                didAppend: { buffer in
+                adaptor: pixelAdaptor,
+                frameCount: Self.frameCount,
+                frameRate: Self.frameRate,
+                didAppend: { time in
                     guard let progress else { return }
-                    let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(buffer))
+                    let seconds = CMTimeGetSeconds(time)
                     guard seconds.isFinite else { return }
                     progress(0.9 * min(max((seconds + 1.0 / 60.0) / outputSeconds, 0), 1))
                 }
@@ -503,7 +513,8 @@ struct LivePhotoMaker: Sendable {
             let template = try await Self.makeTemplatePumps(
                 templateURL: url,
                 writer: writer,
-                stillTime: plan.stillTime
+                stillTime: plan.stillTime,
+                endTime: outputDuration
             )
             metadataReader = template.reader
             pumps.append(contentsOf: template.pumps)
@@ -582,6 +593,10 @@ struct LivePhotoMaker: Sendable {
             Self.abort(writer, readers: readers)
             throw LivePhotoError.writerFailed(reason)
         }
+        // The frame grid stops after the last frame even if the compositor has more to give.
+        for reader in readers where reader.status == .reading {
+            reader.cancelReading()
+        }
 
         await Self.finish(writer)
         guard writer.status == .completed else {
@@ -589,15 +604,21 @@ struct LivePhotoMaker: Sendable {
         }
     }
 
-    /// Copies the template's two mebx tracks (live-photo-info first, then the still track) the way the
-    /// working generators do: all 60 live-photo-info samples pass through unchanged (0.05 s to 1.05 s,
-    /// slightly past the 1 s video, as in Video2LivePhoto). Only the still sample is moved, to `stillTime`
-    /// (0.5 s, the template's own position, unless another key photo was chosen).
+    /// Copies the template's two mebx tracks (live-photo-info first, then the still track).
+    ///
+    /// The template stores every sample at media time 0 and places it with an edit list (an empty
+    /// edit of 0.05 s for live-photo-info, 0.5 s for the still). AVAssetReader hands metadata samples
+    /// out on the media timeline, so each live-photo-info sample is shifted back onto the template's
+    /// presentation timeline (0.05 s onwards, 1/60 s apart) and samples starting at or after `endTime`
+    /// are dropped. That leaves 57 samples from 0.05 s to 1.0 s, the layout verified on iOS 26.
+    /// The still sample is moved to `stillTime` (0.5 s unless another key photo was chosen).
+    /// AVAssetWriter inserts the matching empty edits because the session starts at zero.
     private static func makeTemplatePumps(
         templateURL: URL,
         writer: AVAssetWriter,
-        stillTime: CMTime
-    ) async throws -> (reader: AVAssetReader, pumps: [SamplePump]) {
+        stillTime: CMTime,
+        endTime: CMTime
+    ) async throws -> (reader: AVAssetReader, pumps: [MediaPump]) {
         let templateAsset = AVURLAsset(url: templateURL)
         let tracks: [AVAssetTrack]
         do {
@@ -624,11 +645,23 @@ struct LivePhotoMaker: Sendable {
             guard let format: CMFormatDescription = formats.first else {
                 throw LivePhotoError.templateUnavailable("A template track has no format.")
             }
+            let segments: [AVAssetTrackSegment]
+            do {
+                segments = try await track.load(.segments)
+            } catch {
+                throw LivePhotoError.templateUnavailable(error.localizedDescription)
+            }
+            let firstEdit: AVAssetTrackSegment? = segments.first { !$0.isEmpty }
+            let presentationStart: CMTime = firstEdit?.timeMapping.target.start ?? .zero
             let identifiers: [String] = formats.flatMap { Self.metadataIdentifiers(of: $0) }
             if identifiers.contains(stillImageTimeIdentifier) {
-                stillTracks.append(TemplateTrack(track: track, format: format, isStill: true))
+                stillTracks.append(TemplateTrack(
+                    track: track, format: format, isStill: true, presentationStart: presentationStart
+                ))
             } else if identifiers.contains(livePhotoInfoIdentifier) {
-                infoTracks.append(TemplateTrack(track: track, format: format, isStill: false))
+                infoTracks.append(TemplateTrack(
+                    track: track, format: format, isStill: false, presentationStart: presentationStart
+                ))
             }
         }
         guard !stillTracks.isEmpty else {
@@ -638,7 +671,7 @@ struct LivePhotoMaker: Sendable {
             throw LivePhotoError.templateUnavailable("The template has no live-photo-info track.")
         }
 
-        var pumps: [SamplePump] = []
+        var pumps: [MediaPump] = []
         for item in infoTracks + stillTracks {
             let output = AVAssetReaderTrackOutput(track: item.track, outputSettings: nil)
             output.alwaysCopiesSampleData = false
@@ -661,9 +694,14 @@ struct LivePhotoMaker: Sendable {
                     return Self.retimed(buffer, to: stillTime, duration: CMTime(value: 1, timescale: 600)) ?? buffer
                 }))
             } else {
+                let shift = TimelineShift(presentationStart: item.presentationStart)
                 pumps.append(SamplePump(label: "info", output: output, input: input, transform: {
                     (buffer: CMSampleBuffer) -> CMSampleBuffer? in
-                    CMSampleBufferGetNumSamples(buffer) > 0 ? buffer : nil
+                    guard CMSampleBufferGetNumSamples(buffer) > 0 else { return nil }
+                    let offset = shift.offset(forFirstSampleAt: CMSampleBufferGetPresentationTimeStamp(buffer))
+                    guard let moved = Self.shifted(buffer, by: offset) else { return nil }
+                    let start = CMSampleBufferGetPresentationTimeStamp(moved)
+                    return CMTimeCompare(start, endTime) < 0 ? moved : nil
                 }))
             }
         }
@@ -735,6 +773,45 @@ struct LivePhotoMaker: Sendable {
             items: [item],
             timeRange: CMTimeRange(start: time, duration: CMTime(value: 1, timescale: 600))
         )
+    }
+
+    /// Copy of `buffer` with every sample moved by `offset`; durations are kept.
+    static func shifted(_ buffer: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
+        if CMTimeCompare(offset, .zero) == 0 {
+            return buffer
+        }
+        var needed: CMItemCount = 0
+        _ = CMSampleBufferGetSampleTimingInfoArray(
+            buffer,
+            entryCount: 0,
+            arrayToFill: nil,
+            entriesNeededOut: &needed
+        )
+        guard needed > 0 else { return nil }
+        var timings = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: needed)
+        let readStatus = CMSampleBufferGetSampleTimingInfoArray(
+            buffer,
+            entryCount: needed,
+            arrayToFill: &timings,
+            entriesNeededOut: &needed
+        )
+        guard readStatus == 0 else { return nil }
+        for index in timings.indices {
+            timings[index].presentationTimeStamp = CMTimeAdd(timings[index].presentationTimeStamp, offset)
+            if timings[index].decodeTimeStamp.isNumeric {
+                timings[index].decodeTimeStamp = CMTimeAdd(timings[index].decodeTimeStamp, offset)
+            }
+        }
+        var copy: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: buffer,
+            sampleTimingEntryCount: timings.count,
+            sampleTimingArray: timings,
+            sampleBufferOut: &copy
+        )
+        guard status == 0 else { return nil }
+        return copy
     }
 
     static func retimed(_ buffer: CMSampleBuffer, to presentationTime: CMTime, duration: CMTime) -> CMSampleBuffer? {
@@ -878,8 +955,148 @@ final class LivePhotoOnceFlag: @unchecked Sendable {
     }
 }
 
+/// Something that feeds one writer input on its own serial queue until its source runs dry.
+fileprivate protocol MediaPump: AnyObject {
+    var isFinished: Bool { get }
+    var appendFailed: Bool { get }
+    func start()
+}
+
+/// Learns, from the first sample a reader hands out, how far samples must move so that the first
+/// one lands at `presentationStart`. Correct whether or not the reader already applied the edit list.
+fileprivate final class TimelineShift: @unchecked Sendable {
+    private let presentationStart: CMTime
+    private let lock = NSLock()
+    private var resolved: CMTime?
+
+    init(presentationStart: CMTime) {
+        self.presentationStart = presentationStart
+    }
+
+    func offset(forFirstSampleAt time: CMTime) -> CMTime {
+        lock.lock()
+        defer { lock.unlock() }
+        if let resolved {
+            return resolved
+        }
+        let value: CMTime = time.isNumeric ? CMTimeSubtract(presentationStart, time) : .zero
+        resolved = value
+        return value
+    }
+}
+
+/// Writes exactly `frameCount` frames at `frameRate` (frame i at i / frameRate). Each grid slot shows
+/// the newest rendered frame that is not later than the slot (half a slot of tolerance), so a slower
+/// source has frames repeated and a faster one has frames skipped.
+fileprivate final class FrameGridPump: MediaPump, @unchecked Sendable {
+    private let output: AVAssetReaderOutput
+    private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+    private let frameCount: Int
+    private let frameRate: Int32
+    private let queue: DispatchQueue
+    private let didAppend: ((CMTime) -> Void)?
+    private let lock = NSLock()
+    private var finishedFlag = false
+    private var failedFlag = false
+
+    // Only touched on `queue`.
+    private var nextIndex = 0
+    private var current: CVPixelBuffer?
+    private var pendingBuffer: CVPixelBuffer?
+    private var pendingTime: CMTime = .invalid
+    private var sourceEnded = false
+
+    init(
+        label: String,
+        output: AVAssetReaderOutput,
+        adaptor: AVAssetWriterInputPixelBufferAdaptor,
+        frameCount: Int,
+        frameRate: Int32,
+        didAppend: ((CMTime) -> Void)? = nil
+    ) {
+        self.output = output
+        self.adaptor = adaptor
+        self.frameCount = frameCount
+        self.frameRate = frameRate
+        self.queue = DispatchQueue(label: "com.personal.customize.livephoto.\(label)")
+        self.didAppend = didAppend
+    }
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finishedFlag
+    }
+
+    var appendFailed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failedFlag
+    }
+
+    func start() {
+        adaptor.assetWriterInput.requestMediaDataWhenReady(on: queue) { [self] in
+            self.drain()
+        }
+    }
+
+    private func drain() {
+        if isFinished { return }
+        let input = adaptor.assetWriterInput
+        while input.isReadyForMoreMediaData {
+            guard nextIndex < frameCount else {
+                finish(failed: false)
+                return
+            }
+            let slot = CMTime(value: CMTimeValue(nextIndex), timescale: frameRate)
+            let limit = CMTimeAdd(slot, CMTime(value: 1, timescale: frameRate * 2))
+            advanceSource(before: limit)
+            guard let frame = current ?? pendingBuffer else {
+                // The compositor rendered nothing at all.
+                finish(failed: true)
+                return
+            }
+            guard adaptor.append(frame, withPresentationTime: slot) else {
+                finish(failed: true)
+                return
+            }
+            didAppend?(slot)
+            nextIndex += 1
+        }
+    }
+
+    /// Makes `current` the newest source frame earlier than `limit`.
+    private func advanceSource(before limit: CMTime) {
+        while true {
+            if pendingBuffer == nil {
+                if sourceEnded { return }
+                guard let sample = output.copyNextSampleBuffer() else {
+                    sourceEnded = true
+                    return
+                }
+                guard let pixels = CMSampleBufferGetImageBuffer(sample) else { continue }
+                pendingBuffer = pixels
+                pendingTime = CMSampleBufferGetPresentationTimeStamp(sample)
+            }
+            guard let pending = pendingBuffer, CMTimeCompare(pendingTime, limit) < 0 else { return }
+            current = pending
+            pendingBuffer = nil
+        }
+    }
+
+    /// Only called on `queue`.
+    private func finish(failed: Bool) {
+        if isFinished { return }
+        adaptor.assetWriterInput.markAsFinished()
+        lock.lock()
+        finishedFlag = true
+        if failed { failedFlag = true }
+        lock.unlock()
+    }
+}
+
 /// Moves samples from one reader output to one writer input on its own serial queue.
-fileprivate final class SamplePump: @unchecked Sendable {
+fileprivate final class SamplePump: MediaPump, @unchecked Sendable {
     private let output: AVAssetReaderOutput
     private let input: AVAssetWriterInput
     private let queue: DispatchQueue

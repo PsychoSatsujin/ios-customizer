@@ -110,12 +110,12 @@ final class LivePhotoMakerTests: XCTestCase {
         XCTAssertTrue(identifiers.contains(LivePhotoMaker.stillImageTransformIdentifier))
 
         let stillTrack = try XCTUnwrap(tracks.first { $0.identifiers.contains(LivePhotoMaker.stillImageTimeIdentifier) })
-        let stillSamples = try readMetadataSamples(of: stillTrack.track, in: asset)
+        let stillSamples = try await readMetadataSamples(of: stillTrack.track, in: asset)
         XCTAssertEqual(stillSamples.count, 1)
         XCTAssertEqual(stillSamples.first?.time ?? -1, 0.5, accuracy: 0.002)
 
         let infoTrack = try XCTUnwrap(tracks.first { $0.identifiers.contains(LivePhotoMaker.livePhotoInfoIdentifier) })
-        let infoSamples = try readMetadataSamples(of: infoTrack.track, in: asset)
+        let infoSamples = try await readMetadataSamples(of: infoTrack.track, in: asset)
         let infoCount: Int = infoSamples.reduce(0) { $0 + $1.sampleCount }
         XCTAssertEqual(infoCount, 60)
         XCTAssertEqual(infoSamples.first?.time ?? -1, 0.05, accuracy: 0.005)
@@ -164,6 +164,8 @@ final class LivePhotoMakerTests: XCTestCase {
         XCTAssertEqual(displayed.height, 1920, accuracy: 0.5)
         let frameRate: Float = try await videoTrack.load(.nominalFrameRate)
         XCTAssertEqual(Double(frameRate), 60, accuracy: 2)
+        // The 30 fps source is put on an exact 60 fps grid.
+        XCTAssertEqual(try frameCount(of: videoTrack, in: asset), LivePhotoMaker.frameCount)
         let videoRange: CMTimeRange = try await videoTrack.load(.timeRange)
         XCTAssertEqual(CMTimeGetSeconds(videoRange.duration), options.clipDuration, accuracy: 0.05)
         let duration: CMTime = try await asset.load(.duration)
@@ -176,7 +178,7 @@ final class LivePhotoMakerTests: XCTestCase {
         XCTAssertEqual(tracks.count, 2)
         let stillTrack = try XCTUnwrap(tracks.first { $0.identifiers.contains(LivePhotoMaker.stillImageTimeIdentifier) })
         XCTAssertTrue(stillTrack.identifiers.contains(LivePhotoMaker.stillImageTransformIdentifier))
-        let stillSamples = try readMetadataSamples(of: stillTrack.track, in: asset)
+        let stillSamples = try await readMetadataSamples(of: stillTrack.track, in: asset)
         XCTAssertEqual(stillSamples.count, 1)
         let stillSample = try XCTUnwrap(stillSamples.first)
         XCTAssertEqual(stillSample.time, output.stillTime, accuracy: 0.002)
@@ -184,16 +186,19 @@ final class LivePhotoMakerTests: XCTestCase {
             item.identifier?.rawValue == LivePhotoMaker.stillImageTimeIdentifier
         }
         XCTAssertNotNil(stillItem)
-        XCTAssertEqual(stillItem?.numberValue?.intValue, -1)
+        let stillValue: NSNumber? = try await stillItem?.load(.numberValue)
+        XCTAssertEqual(stillValue?.intValue, -1)
 
-        // live-photo-info is copied unchanged: all 60 template samples, 0.05 s to 1.05 s.
+        // live-photo-info keeps the template's timeline (0.05 s onwards, 1/60 s apart) up to the end
+        // of the video: 57 samples from 0.05 s to 1.0 s.
         let infoTrack = try XCTUnwrap(tracks.first { $0.identifiers.contains(LivePhotoMaker.livePhotoInfoIdentifier) })
-        let infoSamples = try readMetadataSamples(of: infoTrack.track, in: asset)
+        let infoSamples = try await readMetadataSamples(of: infoTrack.track, in: asset)
         let infoCount = infoSamples.reduce(0) { $0 + $1.sampleCount }
-        XCTAssertEqual(infoCount, 60)
+        XCTAssertEqual(infoCount, 57)
         XCTAssertEqual(infoSamples.first?.time ?? -1, 0.05, accuracy: 0.005)
+        XCTAssertEqual(infoSamples.last?.time ?? -1, 0.05 + 56.0 / 60.0, accuracy: 0.005)
         let infoRange: CMTimeRange = try await infoTrack.track.load(.timeRange)
-        XCTAssertEqual(CMTimeGetSeconds(CMTimeRangeGetEnd(infoRange)), 1.05, accuracy: 0.02)
+        XCTAssertEqual(CMTimeGetSeconds(CMTimeRangeGetEnd(infoRange)), 1.0, accuracy: 0.02)
 
         // Still image: paired by MakerApple 17, same size as the video, upright.
         let properties = try imageProperties(at: output.photoURL)
@@ -261,13 +266,14 @@ final class LivePhotoMakerTests: XCTestCase {
         XCTAssertEqual(tracks.count, 1)
         let stillTrack = try XCTUnwrap(tracks.first)
         XCTAssertEqual(stillTrack.identifiers, [LivePhotoMaker.stillImageTimeIdentifier])
-        let samples = try readMetadataSamples(of: stillTrack.track, in: asset)
+        let samples = try await readMetadataSamples(of: stillTrack.track, in: asset)
         XCTAssertEqual(samples.count, 1)
         let sample = try XCTUnwrap(samples.first)
         XCTAssertEqual(sample.time, 0.25, accuracy: 0.002)
         let item = sample.group?.items.first
         XCTAssertEqual(item?.identifier?.rawValue, LivePhotoMaker.stillImageTimeIdentifier)
-        XCTAssertEqual(item?.numberValue?.intValue, -1)
+        let value: NSNumber? = try await item?.load(.numberValue)
+        XCTAssertEqual(value?.intValue, -1)
 
         let properties = try imageProperties(at: output.photoURL)
         let makerApple = try XCTUnwrap(properties[kCGImagePropertyMakerAppleDictionary as String] as? [String: Any])
@@ -410,7 +416,15 @@ private extension LivePhotoMakerTests {
         return result
     }
 
-    func readMetadataSamples(of track: AVAssetTrack, in asset: AVAsset) throws -> [MetadataSample] {
+    /// Samples of a timed-metadata track with their times on the presentation timeline.
+    /// AVAssetReader hands metadata samples out on the media timeline, so they are mapped through
+    /// the track's edit list (its first non-empty segment).
+    func readMetadataSamples(of track: AVAssetTrack, in asset: AVAsset) async throws -> [MetadataSample] {
+        let segments: [AVAssetTrackSegment] = try await track.load(.segments)
+        let firstEdit: AVAssetTrackSegment? = segments.first { !$0.isEmpty }
+        let mediaToPresentation: Double = firstEdit.map { segment in
+            CMTimeGetSeconds(segment.timeMapping.target.start) - CMTimeGetSeconds(segment.timeMapping.source.start)
+        } ?? 0
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         guard reader.canAdd(output) else {
@@ -426,11 +440,31 @@ private extension LivePhotoMakerTests {
         while let buffer = output.copyNextSampleBuffer() {
             let count = CMSampleBufferGetNumSamples(buffer)
             guard count > 0 else { continue }
-            let time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(buffer))
+            let time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(buffer)) + mediaToPresentation
             samples.append(MetadataSample(time: time, sampleCount: count, group: AVTimedMetadataGroup(sampleBuffer: buffer)))
         }
         XCTAssertNotEqual(reader.status, .failed, reader.error?.localizedDescription ?? "")
         return samples
+    }
+
+    func frameCount(of track: AVAssetTrack, in asset: AVAsset) throws -> Int {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        guard reader.canAdd(output) else {
+            XCTFail("The video track cannot be read.")
+            return 0
+        }
+        reader.add(output)
+        guard reader.startReading() else {
+            XCTFail("Reading failed to start: \(reader.error?.localizedDescription ?? "unknown")")
+            return 0
+        }
+        var count = 0
+        while let buffer = output.copyNextSampleBuffer() {
+            count += CMSampleBufferGetNumSamples(buffer)
+        }
+        XCTAssertNotEqual(reader.status, .failed, reader.error?.localizedDescription ?? "")
+        return count
     }
 
     func contentIdentifier(of asset: AVURLAsset) async throws -> String? {
@@ -439,7 +473,7 @@ private extension LivePhotoMakerTests {
             item.identifier == AVMetadataIdentifier.quickTimeMetadataContentIdentifier
                 || (item.key as? String) == LivePhotoMaker.contentIdentifierKey
         }
-        return match?.stringValue
+        return try await match?.load(.stringValue)
     }
 
     func imageProperties(at url: URL) throws -> [String: Any] {
