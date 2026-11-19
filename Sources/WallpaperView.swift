@@ -1,4 +1,5 @@
 import SwiftUI
+import Photos
 import PhotosUI
 import UIKit
 
@@ -9,6 +10,7 @@ struct WallpaperView: View {
     @State private var pickedItem: PhotosPickerItem?
     @State private var image: UIImage?
     @State private var status: String = ""
+    @State private var isSaving = false
 
     var body: some View {
         NavigationStack {
@@ -39,7 +41,7 @@ struct WallpaperView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(image == nil)
+                .disabled(image == nil || isSaving)
 
                 if !status.isEmpty {
                     Text(status)
@@ -68,7 +70,23 @@ struct WallpaperView: View {
 
     private func save() {
         guard let image else { return }
-        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
-        status = "Saved. Set it from Photos or with a Shortcut."
+        isSaving = true
+        status = ""
+        Task {
+            defer { isSaving = false }
+            let access = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+            guard access == .authorized || access == .limited else {
+                status = "Photos access is off. Allow it in Settings > Privacy & Security > Photos > Customize."
+                return
+            }
+            do {
+                try await PHPhotoLibrary.shared().performChanges {
+                    _ = PHAssetChangeRequest.creationRequestForAsset(from: image)
+                }
+                status = "Saved. Set it from Photos or with a Shortcut."
+            } catch {
+                status = "Could not save: \(error.localizedDescription)"
+            }
+        }
     }
 }

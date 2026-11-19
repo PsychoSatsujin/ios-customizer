@@ -13,8 +13,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.personal.customize
         GENERATE_INFOPLIST_FILE: YES
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.2.0"
+        CURRENT_PROJECT_VERSION: "2"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
         INFOPLIST_KEY_CFBundleDisplayName: Customize
@@ -23,12 +23,32 @@ targets:
         INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: Saves the wallpapers you create to your photo library.
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
+  CustomizeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: Customize
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.personal.customize.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
 schemes:
   Customize:
     build:
       targets:
         Customize: all
+        CustomizeTests: [test]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - CustomizeTests
     archive:
       config: Release
